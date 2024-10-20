@@ -4,9 +4,6 @@ from atproto import Client
 import logging
 from datetime import datetime
 
-# Set up logging
-logging.basicConfig(filename='/home/pi/bskyTFL/tfl_bot.log', level=logging.INFO,
-                    format='%(asctime)s - %(message)s')
 
 # TfL API endpoint
 TFL_API_URL = "https://api.tfl.gov.uk/Line/Mode/tube,overground,dlr,tram/Status"
