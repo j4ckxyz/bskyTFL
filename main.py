@@ -3,6 +3,7 @@ import time
 from atproto import Client
 import logging
 from datetime import datetime
+import random
 
 
 # TfL API endpoint
@@ -14,6 +15,7 @@ BLUESKY_PASSWORD = "app_password"
 
 # Dictionary to store the most recent status for each line
 last_status = {}
+
 
 def get_tfl_status():
     response = requests.get(TFL_API_URL)
@@ -38,11 +40,16 @@ def process_tfl_data(data):
                 
                 # Add reason if available
                 if 'reason' in line_status:
-                    update += f"\nReason: {line_status['reason']}"
+                    update += f"\n{line_status['reason']}"
                 
-                # Add URL if available
-                if 'url' in line_status:
-                    update += f"\nMore info: {line_status['url']}"
+                # Add disruption info if available
+                for disruption in line.get('disruptions', []):
+                    if 'description' in disruption:
+                        update += f"\n{disruption['description']}"
+                
+                # Truncate the update if it's too long
+                if len(update) > 300:
+                    update = update[:297] + "..."
                 
                 updates.append(update)
             
@@ -55,14 +62,23 @@ def post_to_bluesky(client, update):
     client.send_post(text=update)
 
 def main():
+    logging.info("TfL Bot started")
     bluesky_client = Client()
-    bluesky_client.login(BLUESKY_USERNAME, BLUESKY_PASSWORD)
+    retry_delay = 1
+    max_retry_delay = 3600  # Maximum delay of 1 hour
 
-    
-    tfl_data = get_tfl_status()
-    if tfl_data:
-        process_tfl_data(tfl_data)
-    
+    while True:
+        try:
+            bluesky_client.login(BLUESKY_USERNAME, BLUESKY_PASSWORD)
+            logging.info("Successfully logged in to Bluesky")
+            retry_delay = 1  # Reset delay on successful login
+            break
+        except Exception as e:
+            logging.error(f"Failed to log in to Bluesky: {str(e)}")
+            retry_delay = min(retry_delay * 2 + random.uniform(0, 1), max_retry_delay)
+            logging.info(f"Retrying in {retry_delay} seconds")
+            time.sleep(retry_delay)
+
     while True:
         try:
             tfl_data = get_tfl_status()
