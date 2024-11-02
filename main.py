@@ -1,98 +1,117 @@
-import requests
 import time
+import requests
 from atproto import Client
 import logging
-from datetime import datetime
-import random
+import json
+from datetime import datetime, timezone
+from pathlib import Path
 
+# Set up logging to console
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
 
-# TfL API endpoint
-TFL_API_URL = "https://api.tfl.gov.uk/Line/Mode/tube,overground,dlr,tram/Status"
-
-# Bluesky credentials (replace with your own)
-BLUESKY_USERNAME = "username.bsky.social"
+# Bluesky credentials
+BLUESKY_USERNAME = "username.bsky.socialk"
 BLUESKY_PASSWORD = "app_password"
 
-# Dictionary to store the most recent status for each line
-last_status = {}
+# TfL API endpoint
+TFL_API_URL = "https://api.tfl.gov.uk/Line/Mode/tube,overground,dlr,elizabeth-line/Status"
 
+# Initialize Bluesky client
+client = Client()
+client.login(BLUESKY_USERNAME, BLUESKY_PASSWORD)
+
+# Add constants for post tracking
+POSTS_LOG_FILE = 'tfl_posts.json'
+
+def load_posted_statuses():
+    try:
+        with open(POSTS_LOG_FILE, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {'posts': []}
+
+def save_posted_status(message, posted_time):
+    posted_statuses = load_posted_statuses()
+    posted_statuses['posts'].append({
+        'text': message,
+        'timestamp': posted_time.isoformat()
+    })
+    
+    # Keep only last 100 posts
+    posted_statuses['posts'] = posted_statuses['posts'][-100:]
+    
+    with open(POSTS_LOG_FILE, 'w') as f:
+        json.dump(posted_statuses, f)
+
+def is_already_posted(message):
+    posted_statuses = load_posted_statuses()
+    current_time = datetime.now(timezone.utc)
+    
+    # Check for exact message match within the last hour (3600 seconds)
+    return any(
+        post['text'] == message and 
+        (current_time - datetime.fromisoformat(post['timestamp'])).total_seconds() < 3600  # 1 hour window
+        for post in posted_statuses['posts']
+    )
 
 def get_tfl_status():
-    response = requests.get(TFL_API_URL)
-    if response.status_code == 200:
-        return response.json()
-    else:
-        print(f"Error fetching TfL status: {response.status_code}")
+    try:
+        response = requests.get(TFL_API_URL, timeout=10)  # Added timeout
+        if response.status_code == 200:
+            return response.json()
+        else:
+            logging.error(f"Error fetching TfL status: {response.status_code}")
+            return None
+    except requests.RequestException as e:
+        logging.error(f"Request failed: {e}")
         return None
 
-def process_tfl_data(data):
-    updates = []
-    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    for line in data:
-        line_name = line['name']
-        line_status = line['lineStatuses'][0]
-        status = line_status['statusSeverityDescription']
-        
-        # Check if the status has changed
-        if line_name not in last_status or last_status[line_name] != status:
-            if status != "Good Service":
-                update = f"{current_time}\n{line_name}: {status}"
-                
-                # Add reason if available
-                if 'reason' in line_status:
-                    update += f"\n{line_status['reason']}"
-                
-                # Add disruption info if available
-                for disruption in line.get('disruptions', []):
-                    if 'description' in disruption:
-                        update += f"\n{disruption['description']}"
-                
-                # Truncate the update if it's too long
-                if len(update) > 300:
-                    update = update[:297] + "..."
-                
-                updates.append(update)
-            
-            # Update the last known status for this line
-            last_status[line_name] = status
-    
-    return updates
-
-def post_to_bluesky(client, update):
-    client.send_post(text=update)
+def post_to_bluesky(message):
+    try:
+        if not is_already_posted(message):
+            client.send_post(text=message)
+            save_posted_status(message, datetime.now(timezone.utc))
+            logging.info(f"Posted to Bluesky: {message}")
+            return True
+        else:
+            logging.info(f"Skipping duplicate post: {message}")
+            return False
+    except Exception as e:
+        logging.error(f"Error posting to Bluesky: {e}")
+        return False
 
 def main():
-    logging.info("TfL Bot started")
-    bluesky_client = Client()
-    retry_delay = 1
-    max_retry_delay = 3600  # Maximum delay of 1 hour
-
     while True:
         try:
-            bluesky_client.login(BLUESKY_USERNAME, BLUESKY_PASSWORD)
-            logging.info("Successfully logged in to Bluesky")
-            retry_delay = 1  # Reset delay on successful login
-            break
-        except Exception as e:
-            logging.error(f"Failed to log in to Bluesky: {str(e)}")
-            retry_delay = min(retry_delay * 2 + random.uniform(0, 1), max_retry_delay)
-            logging.info(f"Retrying in {retry_delay} seconds")
-            time.sleep(retry_delay)
-
-    while True:
-        try:
-            tfl_data = get_tfl_status()
-            if tfl_data:
-                updates = process_tfl_data(tfl_data)
-                for update in updates:
-                    post_to_bluesky(bluesky_client, update)
-                    logging.info(f"Posted update: {update}")
+            status_data = get_tfl_status()
+            if status_data:
+                current_issues = []
+                
+                for line in status_data:
+                    line_name = line['name']
+                    status = line['lineStatuses'][0]['statusSeverityDescription']
+                    
+                    if status != "Good Service":
+                        message = f"{line_name}: {status}"
+                        if not is_already_posted(message):
+                            current_issues.append(message)
+                
+                # Post all current issues in a single message if possible
+                if current_issues:
+                    combined_message = "\n".join(current_issues)
+                    if len(combined_message) <= 300:  # Bluesky character limit
+                        post_to_bluesky(combined_message)
+                    else:
+                        # If too long, post individually
+                        for message in current_issues:
+                            post_to_bluesky(message)
             
-            # Wait for 5 minutes before checking again
-            time.sleep(300)
+            time.sleep(300)  # 5 minute delay
+            
         except Exception as e:
-            logging.error(f"An error occurred: {str(e)}")
-            time.sleep(60)  # Wait a minute before trying again
+            logging.error(f"Error in main loop: {e}")
+            time.sleep(60)  # Wait a minute before retrying if there's an error
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
